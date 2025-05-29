@@ -64,6 +64,10 @@ interface UploadFileToThreadArgs {
   initial_comment?: string;
 }
 
+interface GetMessageFromUrlArgs {
+  url: string;
+}
+
 // Tool definitions
 const listChannelsTool: Tool = {
   name: "slack_list_channels",
@@ -278,6 +282,22 @@ const uploadFileToThreadTool: Tool = {
   },
 };
 
+const getMessageFromUrlTool: Tool = {
+  name: "slack_get_message_from_url",
+  description:
+    "Fetch a single Slack message (DMs included) from a shared message URL",
+  inputSchema: {
+    type: "object",
+    properties: {
+      url: {
+        type: "string",
+        description: "The shared Slack message URL",
+      },
+    },
+    required: ["url"],
+  },
+};
+
 class SlackClient {
   private botHeaders: { Authorization: string; "Content-Type": string };
 
@@ -286,6 +306,37 @@ class SlackClient {
       Authorization: `Bearer ${botToken}`,
       "Content-Type": "application/json",
     };
+  }
+
+  parseMessageUrl(url: string): { channel_id: string; ts: string } {
+    const parsed = new URL(url);
+
+    let channel_id = "";
+    let ts = "";
+
+    // Try /archives/{channel_id}/p{timestamp}
+    const archiveMatch = parsed.pathname.match(/archives\/(\w+)\/p(\d{10})(\d{6})/);
+    if (archiveMatch) {
+      channel_id = archiveMatch[1];
+      ts = `${archiveMatch[2]}.${archiveMatch[3]}`;
+      return { channel_id, ts };
+    }
+
+    // Fallback to query parameters like channel and message_ts
+    channel_id = parsed.searchParams.get("channel") || parsed.searchParams.get("cid") || "";
+    const rawTs =
+      parsed.searchParams.get("message_ts") || parsed.searchParams.get("ts") || "";
+
+    if (channel_id && rawTs) {
+      if (/^p\d{16}$/.test(rawTs)) {
+        ts = `${rawTs.slice(1, 11)}.${rawTs.slice(11)}`;
+      } else {
+        ts = rawTs;
+      }
+      return { channel_id, ts };
+    }
+
+    throw new Error("Invalid Slack message URL");
   }
 
   async getChannels(limit: number = 100, cursor?: string): Promise<any> {
@@ -382,6 +433,22 @@ class SlackClient {
 
     const response = await fetch(
       `https://slack.com/api/conversations.replies?${params}`,
+      { headers: this.botHeaders },
+    );
+
+    return response.json();
+  }
+
+  async getMessage(channel_id: string, ts: string): Promise<any> {
+    const params = new URLSearchParams({
+      channel: channel_id,
+      latest: ts,
+      inclusive: "true",
+      limit: "1",
+    });
+
+    const response = await fetch(
+      `https://slack.com/api/conversations.history?${params}`,
       { headers: this.botHeaders },
     );
 
@@ -807,6 +874,19 @@ async function main() {
             };
           }
 
+          case "slack_get_message_from_url": {
+            const args = request.params
+              .arguments as unknown as GetMessageFromUrlArgs;
+            if (!args.url) {
+              throw new Error("Missing required argument: url");
+            }
+            const { channel_id, ts } = slackClient.parseMessageUrl(args.url);
+            const response = await slackClient.getMessage(channel_id, ts);
+            return {
+              content: [{ type: "text", text: JSON.stringify(response) }],
+            };
+          }
+
           default:
             throw new Error(`Unknown tool: ${request.params.name}`);
         }
@@ -840,6 +920,7 @@ async function main() {
         getUserProfileTool,
         downloadThreadFilesTool,
         uploadFileToThreadTool,
+        getMessageFromUrlTool,
       ],
     };
   });
