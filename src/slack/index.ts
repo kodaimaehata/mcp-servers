@@ -50,6 +50,20 @@ interface GetUserProfileArgs {
   user_id: string;
 }
 
+interface DownloadThreadFilesArgs {
+  channel_id: string;
+  thread_ts: string;
+  output_folder: string;
+}
+
+interface UploadFileToThreadArgs {
+  channel_id: string;
+  thread_ts: string;
+  file_path: string;
+  title?: string;
+  initial_comment?: string;
+}
+
 // Tool definitions
 const listChannelsTool: Tool = {
   name: "slack_list_channels",
@@ -210,6 +224,60 @@ const getUserProfileTool: Tool = {
   },
 };
 
+const downloadThreadFilesTool: Tool = {
+  name: "slack_download_thread_files",
+  description: "Download files attached to a Slack thread to a specified folder",
+  inputSchema: {
+    type: "object",
+    properties: {
+      channel_id: {
+        type: "string",
+        description: "The ID of the channel containing the thread",
+      },
+      thread_ts: {
+        type: "string",
+        description: "The timestamp of the parent message in the format '1234567890.123456'",
+      },
+      output_folder: {
+        type: "string",
+        description: "Folder path where the files should be downloaded",
+      },
+    },
+    required: ["channel_id", "thread_ts", "output_folder"],
+  },
+};
+
+const uploadFileToThreadTool: Tool = {
+  name: "slack_upload_file_to_thread",
+  description: "Upload a file as a reply to a specific Slack thread",
+  inputSchema: {
+    type: "object",
+    properties: {
+      channel_id: {
+        type: "string",
+        description: "The ID of the channel containing the thread"
+      },
+      thread_ts: {
+        type: "string",
+        description: "The timestamp of the parent message in the format '1234567890.123456'"
+      },
+      file_path: {
+        type: "string",
+        description: "Path to the file to upload"
+      },
+      title: {
+        type: "string",
+        description: "Title of the file (optional)"
+      },
+      initial_comment: {
+        type: "string",
+        description: "Text message to accompany the file (optional)"
+      }
+    },
+    required: ["channel_id", "thread_ts", "file_path"],
+  },
+};
+
 class SlackClient {
   private botHeaders: { Authorization: string; "Content-Type": string };
 
@@ -349,6 +417,201 @@ class SlackClient {
     );
 
     return response.json();
+  }
+
+  async downloadThreadFiles(
+    channel_id: string,
+    thread_ts: string,
+    output_folder: string
+  ): Promise<string[]> {
+    // Get all messages in the thread
+    const threadData = await this.getThreadReplies(channel_id, thread_ts);
+    
+    if (!threadData.ok) {
+      throw new Error(`Failed to get thread data: ${threadData.error}`);
+    }
+
+    const fileNames: string[] = [];
+    const fs = await import('fs');
+    const path = await import('path');
+    const https = await import('https');
+
+    // Check if output folder exists, if not throw an error
+    if (!fs.existsSync(output_folder)) {
+      throw new Error(`Output folder does not exist: ${output_folder}`);
+    }
+
+    // Extract files from all messages in the thread
+    const promises = threadData.messages
+      .filter((message: any) => message.files && message.files.length > 0)
+      .flatMap((message: any) => 
+        message.files.map(async (file: any) => {
+          // Create a safe filename
+          const fileName = path.join(
+            output_folder, 
+            file.name.replace(/[/\\?%*:|"<>]/g, '_')
+          );
+          
+          // Download the file
+          await new Promise<void>((resolve, reject) => {
+            const fileRequest = https.get(
+              file.url_private,
+              { headers: { Authorization: this.botHeaders.Authorization } },
+              (response) => {
+                if (response.statusCode !== 200) {
+                  reject(new Error(`Failed to download file: ${response.statusCode}`));
+                  return;
+                }
+                
+                const fileStream = fs.createWriteStream(fileName);
+                response.pipe(fileStream);
+                
+                fileStream.on('finish', () => {
+                  fileStream.close();
+                  fileNames.push(fileName);
+                  resolve();
+                });
+              }
+            );
+            
+            fileRequest.on('error', (err) => {
+              fs.unlink(fileName, () => {}); // Delete partially downloaded file
+              reject(err);
+            });
+            
+            fileRequest.end();
+          });
+        })
+      );
+
+    await Promise.all(promises);
+    return fileNames;
+  }
+
+  async uploadFileToThread(
+    channel_id: string,
+    thread_ts: string,
+    file_path: string,
+    title?: string,
+    initial_comment?: string
+  ): Promise<any> {
+    const fs = await import('fs');
+    const path = await import('path');
+    const { Buffer } = await import('buffer');
+
+    // Check if file exists
+    if (!fs.existsSync(file_path)) {
+      throw new Error(`File does not exist: ${file_path}`);
+    }
+
+    // Get file info
+    const fileStats = fs.statSync(file_path);
+    const fileSize = fileStats.size;
+    const filename = path.basename(file_path);
+    const fileContent = fs.readFileSync(file_path);
+
+    // Step 1: Get upload URL and file ID using files.getUploadURLExternal
+    let upload_url = '';
+    let file_id = '';
+    
+    try {
+      const params = new URLSearchParams({
+        filename,
+        length: fileSize.toString(),
+        ...(title && { title })
+      });
+
+      const urlResponse = await fetch(`https://slack.com/api/files.getUploadURLExternal?${params}`, {
+        method: 'GET',
+        headers: {
+          Authorization: this.botHeaders.Authorization
+        }
+      });
+
+      // レスポンスのステータスをログに出力
+      console.error(`Response status: ${urlResponse.status} ${urlResponse.statusText}`);
+      
+      // レスポンスの内容を取得
+      const responseText = await urlResponse.text();
+      console.error(`Response body: ${responseText}`);
+      
+      // JSONとして解析
+      let urlData;
+      try {
+        urlData = JSON.parse(responseText);
+      } catch (parseError) {
+        console.error(`JSON parse error: ${parseError}`);
+        throw new Error(`Failed to parse response as JSON: ${responseText}`);
+      }
+      
+      if (!urlData.ok) {
+        const errorDetail = urlData.error || 'Unknown error';
+        let errorMsg = `Slack API error: ${errorDetail}`;
+        if (urlData.detail) {
+          errorMsg += ` - ${urlData.detail}`;
+        }
+        console.error(errorMsg);
+        throw new Error(errorMsg);
+      }
+
+      // 変数に値を代入
+      upload_url = urlData.upload_url;
+      file_id = urlData.file_id;
+
+      // Step 2: Upload file to the temporary URL
+      const uploadResponse = await fetch(upload_url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/octet-stream'
+        },
+        body: fileContent
+      });
+
+      if (!uploadResponse.ok) {
+        throw new Error(`Failed to upload file: ${uploadResponse.statusText}`);
+      }
+    } catch (error) {
+      console.error('Fetch error details:', error);
+      if (error instanceof TypeError && error.message.includes('fetch')) {
+        console.error('Network error occurred during fetch');
+      }
+      throw new Error(`Failed to get upload URL: ${error instanceof Error ? error.message : String(error)}`);
+    }
+
+    // Step 3: Complete the upload process using files.completeUploadExternal
+    const completeParams: any = {
+      files: [{
+        id: file_id,
+        title: title || filename
+      }],
+      channel_id: channel_id
+    };
+
+    // Add thread_ts if provided
+    if (thread_ts) {
+      completeParams.thread_ts = thread_ts;
+    }
+
+    // Add initial comment if provided
+    if (initial_comment) {
+      completeParams.initial_comment = initial_comment;
+    }
+
+    const completeResponse = await fetch('https://slack.com/api/files.completeUploadExternal', {
+      method: 'POST',
+      headers: {
+        Authorization: this.botHeaders.Authorization,
+        'Content-Type': 'application/x-www-form-urlencoded'
+      },
+      body: new URLSearchParams({
+        files: JSON.stringify(completeParams.files),
+        channel_id: completeParams.channel_id,
+        ...(thread_ts && { thread_ts }),
+        ...(initial_comment && { initial_comment })
+      }).toString()
+    });
+
+    return completeResponse.json();
   }
 }
 
@@ -506,6 +769,44 @@ async function main() {
             };
           }
 
+          case "slack_download_thread_files": {
+            const args = request.params
+              .arguments as unknown as DownloadThreadFilesArgs;
+            if (!args.channel_id || !args.thread_ts || !args.output_folder) {
+              throw new Error(
+                "Missing required arguments: channel_id, thread_ts, and output_folder"
+              );
+            }
+            const downloadedFiles = await slackClient.downloadThreadFiles(
+              args.channel_id,
+              args.thread_ts,
+              args.output_folder
+            );
+            return {
+              content: [{ type: "text", text: JSON.stringify(downloadedFiles) }],
+            };
+          }
+
+          case "slack_upload_file_to_thread": {
+            const args = request.params
+              .arguments as unknown as UploadFileToThreadArgs;
+            if (!args.channel_id || !args.thread_ts || !args.file_path) {
+              throw new Error(
+                "Missing required arguments: channel_id, thread_ts, and file_path"
+              );
+            }
+            const response = await slackClient.uploadFileToThread(
+              args.channel_id,
+              args.thread_ts,
+              args.file_path,
+              args.title,
+              args.initial_comment
+            );
+            return {
+              content: [{ type: "text", text: JSON.stringify(response) }],
+            };
+          }
+
           default:
             throw new Error(`Unknown tool: ${request.params.name}`);
         }
@@ -537,6 +838,8 @@ async function main() {
         getThreadRepliesTool,
         getUsersTool,
         getUserProfileTool,
+        downloadThreadFilesTool,
+        uploadFileToThreadTool,
       ],
     };
   });
