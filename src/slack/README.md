@@ -63,6 +63,12 @@ MCP Server for the Slack API, enabling Claude to interact with Slack workspaces.
      - `user_id` (string): The user's ID
    - Returns: Detailed user profile information
 
+9. `slack_get_message_from_url`
+   - Fetch a single Slack message (DMs included) from a shared message URL
+   - Required inputs:
+     - `url` (string): The shared Slack message URL
+   - Returns: The message data from the Slack API
+
 ## Setup
 
 1. Create a Slack App:
